@@ -1,0 +1,2 @@
+[workspace]
+members = ["xtask", "l4lb", "l4lb-common"]
