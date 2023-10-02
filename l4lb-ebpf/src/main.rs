@@ -4,6 +4,7 @@
 use aya_bpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
 use aya_log_ebpf::info;
 use core::mem;
+use l4lb_common::{FiveTuple, VipKey};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -30,17 +31,6 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     }
 
     Ok((start + offset) as *const T)
-}
-
-// This is a 5tuple struct for IPv4 which is used to identify a flow
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct FiveTuple {
-    source_addr: u32,
-    source_port: u16,
-    dst_addr: u32,
-    dst_port: u16,
-    proto: u8,
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
@@ -87,7 +77,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         source_port,
         dst_addr,
         dst_port,
-        proto: proto as u8,
+        proto,
     };
     info!(
         &ctx,
@@ -98,6 +88,12 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         dst_port,
         proto as u8,
     );
+
+    let vip = VipKey {
+        addr: dst_addr,
+        port: dst_port,
+        proto,
+    };
 
     Ok(xdp_action::XDP_PASS)
 }
