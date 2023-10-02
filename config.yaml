@@ -1,0 +1,10 @@
+vip: 192.168.66.66
+port: 80
+proto: 6 # TCP
+real_servers:
+  - addr: 192.168.67.66
+    port: 80
+  - addr: 192.168.68.66
+    port: 80
+  - addr: 192.168.69.66
+    port: 80
