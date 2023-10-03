@@ -68,8 +68,12 @@ fn format_flags(hdr: &Header) -> &'static str {
                 ""
             }
         }
-        Udp(h) => "",
+        _ => "",
     }
+}
+
+fn get_vip_number(vip: VipKey) -> Option<u32> {
+    unsafe { VIP_INFO.get(&vip).copied() }
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
@@ -138,6 +142,10 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         port: dst_port,
         proto,
     };
+
+    if let Some(vn) = get_vip_number(vip) {
+        info!(&ctx, "found VIP! VIP NUMBER: {}", vn);
+    }
 
     Ok(xdp_action::XDP_PASS)
 }
