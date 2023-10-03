@@ -5,18 +5,23 @@ use std::mem::transmute;
 use std::net::Ipv4Addr;
 
 #[derive(Debug, PartialEq, Deserialize)]
-struct RealServer {
-    addr: Ipv4Addr,
-    port: u16,
+pub struct RealServer {
+    pub addr: Ipv4Addr,
+    pub port: u16,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+pub struct Vip {
+    pub vip: Ipv4Addr,
+    pub port: u16,
+    #[serde(deserialize_with = "deserialize_ip_proto")]
+    pub proto: IpProto,
+    pub real_servers: Vec<RealServer>,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
 pub struct Config {
-    vip: Ipv4Addr,
-    port: u16,
-    #[serde(deserialize_with = "deserialize_ip_proto")]
-    proto: IpProto,
-    real_servers: Vec<RealServer>,
+    pub vips: Vec<Vip>,
 }
 
 fn deserialize_ip_proto<'de, D>(deserializer: D) -> Result<IpProto, D::Error>

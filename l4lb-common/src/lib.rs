@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "user")]
+use aya::Pod;
+
 use network_types::ip::IpProto;
 
 // This is a 5tuple struct for IPv4 which is used to identify a flow
@@ -14,6 +17,9 @@ pub struct FiveTuple {
     pub proto: IpProto,
 }
 
+#[cfg(feature = "user")]
+unsafe impl Pod for FiveTuple {}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct VipKey {
@@ -21,3 +27,6 @@ pub struct VipKey {
     pub port: u16,
     pub proto: IpProto,
 }
+
+#[cfg(feature = "user")]
+unsafe impl Pod for VipKey {}
