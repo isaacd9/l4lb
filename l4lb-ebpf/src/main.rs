@@ -89,6 +89,14 @@ fn hash(flow: FiveTuple) -> u32 {
     hash
 }
 
+fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
+    let mut hash = hash(flow);
+    let mut index = hash % RING_SIZE;
+
+    let real_index = (vip_number * RING_SIZE) + unsafe { CH_RINGS.get(index).copied() }?;
+    unsafe { REALS.get(real_index).copied() }
+}
+
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     use Header::*;
 
@@ -156,9 +164,29 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         proto,
     };
 
-    if let Some(vn) = get_vip_number(vip) {
-        info!(&ctx, "found VIP! VIP NUMBER: {}", vn);
-    }
+    let vip_number = match get_vip_number(vip) {
+        Some(vn) => {
+            info!(&ctx, "found VIP! VIP NUMBER: {}", vn);
+            vn
+        }
+        None => {
+            info!(&ctx, "unknown vip");
+            return Ok(xdp_action::XDP_PASS);
+        }
+    };
+
+    let dest = match get_dest(vip_number, flow) {
+        Some(d) => d,
+        None => {
+            info!(&ctx, "unknown dest");
+            return Ok(xdp_action::XDP_DROP);
+        }
+    };
+
+    info!(
+        &ctx,
+        "found real server! REAL SERVER: {:i}:{}", dest.addr, dest.port
+    );
 
     Ok(xdp_action::XDP_PASS)
 }
