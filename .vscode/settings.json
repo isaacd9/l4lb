@@ -1,3 +1,7 @@
 {
-  "rust-analyzer.linkedProjects": ["Cargo.toml", "l4lb-ebpf/Cargo.toml"]
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "l4lb-ebpf/Cargo.toml",
+    "./l4lb/Cargo.toml"
+  ]
 }

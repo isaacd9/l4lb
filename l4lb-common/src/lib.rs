@@ -4,6 +4,15 @@
 #[cfg(feature = "user")]
 use aya::Pod;
 
+// This is the maximum number of VIPs that can be configured
+pub const MAX_VIPS: u32 = 512;
+// This is the maximum number of entries in an individual consistent hash ring
+pub const RING_SIZE: u32 = 65537;
+// This is the maximum number of real IP addresses that can be configured
+pub const MAX_REALS: u32 = 4096;
+// This is the total size of the consistent hash ring array
+pub const CH_RINGS_SIZE: u32 = RING_SIZE * MAX_VIPS;
+
 use network_types::ip::IpProto;
 
 // This is a 5tuple struct for IPv4 which is used to identify a flow
@@ -30,3 +39,13 @@ pub struct VipKey {
 
 #[cfg(feature = "user")]
 unsafe impl Pod for VipKey {}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RealServer {
+    pub addr: u32,
+    pub port: u16,
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for RealServer {}

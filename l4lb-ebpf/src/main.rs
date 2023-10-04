@@ -4,12 +4,12 @@
 use aya_bpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::hash_map::HashMap,
+    maps::{array::Array, hash_map::HashMap},
     programs::XdpContext,
 };
 use aya_log_ebpf::info;
 use core::mem;
-use l4lb_common::{FiveTuple, VipKey};
+use l4lb_common::{FiveTuple, RealServer, VipKey, CH_RINGS_SIZE, MAX_REALS, MAX_VIPS, RING_SIZE};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -19,7 +19,11 @@ use network_types::{
 
 #[map]
 // Map of VIP key to vip number for the VIP consistent hah table
-static VIP_INFO: HashMap<VipKey, u32> = HashMap::with_max_entries(512, 0);
+static VIP_INFO: HashMap<VipKey, u32> = HashMap::with_max_entries(MAX_VIPS, 0);
+#[map]
+static CH_RINGS: Array<u32> = Array::with_max_entries(CH_RINGS_SIZE, 0);
+#[map]
+static REALS: Array<RealServer> = Array::with_max_entries(MAX_REALS, 0);
 
 #[xdp]
 pub fn l4lb(ctx: XdpContext) -> u32 {
@@ -74,6 +78,15 @@ fn format_flags(hdr: &Header) -> &'static str {
 
 fn get_vip_number(vip: VipKey) -> Option<u32> {
     unsafe { VIP_INFO.get(&vip).copied() }
+}
+
+// terrible hash function for now
+fn hash(flow: FiveTuple) -> u32 {
+    let mut hash = flow.source_addr ^ flow.source_port as u32;
+    hash ^= flow.dst_addr;
+    hash ^= flow.dst_port as u32;
+    hash ^= flow.proto as u32;
+    hash
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {

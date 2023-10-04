@@ -4,7 +4,7 @@ use network_types::ip::IpProto;
 use std::mem::transmute;
 use std::net::Ipv4Addr;
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize, Eq, Hash, Clone, Copy)]
 pub struct RealServer {
     pub addr: Ipv4Addr,
     pub port: u16,
