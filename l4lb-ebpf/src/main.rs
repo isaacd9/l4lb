@@ -7,12 +7,12 @@ use aya_bpf::{
     maps::{array::Array, hash_map::HashMap},
     programs::XdpContext,
 };
-use aya_log_ebpf::info;
+use aya_log_ebpf::{debug, info};
 use core::mem;
 use l4lb_common::{FiveTuple, RealServer, VipKey, CH_RINGS_SIZE, MAX_REALS, MAX_VIPS, RING_SIZE};
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr},
+    ip::{self, IpProto, Ipv4Hdr},
     tcp::TcpHdr,
     udp::UdpHdr,
 };
@@ -34,7 +34,7 @@ pub fn l4lb(ctx: XdpContext) -> u32 {
 }
 
 #[inline(always)] //
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
     let len = mem::size_of::<T>();
@@ -43,16 +43,16 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
         return Err(());
     }
 
-    Ok((start + offset) as *const T)
+    Ok((start + offset) as *mut T)
 }
 
-enum Header {
-    Tcp(*const TcpHdr),
-    Udp(*const UdpHdr),
+enum TransportProtocolHeader {
+    Tcp(*mut TcpHdr),
+    Udp(*mut UdpHdr),
 }
 
-fn format_flags(hdr: &Header) -> &'static str {
-    use Header::*;
+fn format_flags(hdr: &TransportProtocolHeader) -> &'static str {
+    use TransportProtocolHeader::*;
 
     match *hdr {
         Tcp(h) => {
@@ -82,23 +82,66 @@ fn get_vip_number(vip: VipKey) -> Option<u32> {
 
 // terrible hash function for now
 fn hash(flow: FiveTuple) -> u32 {
-    let mut hash = flow.source_addr ^ flow.source_port as u32;
-    hash ^= flow.dst_addr;
+    let mut hash = flow.source_addr;
+    hash ^= flow.source_port as u32;
+    hash ^= flow.dst_addr as u32;
     hash ^= flow.dst_port as u32;
     hash ^= flow.proto as u32;
     hash
 }
 
 fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
-    let mut hash = hash(flow);
-    let mut index = hash % RING_SIZE;
+    let hash = hash(flow);
+    let index = hash % RING_SIZE;
 
-    let real_index = (vip_number * RING_SIZE) + unsafe { CH_RINGS.get(index).copied() }?;
-    unsafe { REALS.get(real_index).copied() }
+    let real_index = (vip_number * RING_SIZE) + CH_RINGS.get(index).copied()?;
+
+    REALS.get(real_index).copied()
+}
+
+#[inline(always)]
+fn ipv4_checksum(ctx: &XdpContext, hdr: *const Ipv4Hdr) -> u16 {
+    let ptr = hdr as *const u16;
+    let length = mem::size_of::<Ipv4Hdr>();
+    let mut sum: u32 = 0;
+
+    // Divide the header into 16-bit chunks and sum them. Need to divide by 2
+    // because size of is byte-denominated.
+    for i in 0..(length / 2) {
+        sum += unsafe { *(ptr.add(i)) } as u32;
+    }
+
+    while sum >> 16_u32 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16_u32);
+    }
+
+    !(sum as u16)
+}
+
+fn mangle_packet(
+    ctx: &XdpContext,
+    ipv4hdr: *mut Ipv4Hdr,
+    protocol_header: TransportProtocolHeader,
+    real: RealServer,
+) {
+    unsafe { (*ipv4hdr).dst_addr = u32::to_be(real.addr) };
+    // It's possible that we could eliminate this by doing some math on the
+    // checksum to avoid recomputing the whole thing. For now tho, just
+    // recompute the entire checksum.
+    let old_checksum = unsafe { (*ipv4hdr).check };
+    // Zero out the checksum before computing it
+    unsafe { (*ipv4hdr).check = 0 };
+    let sum = unsafe {
+        (*ipv4hdr).check = ipv4_checksum(ctx, ipv4hdr);
+    };
+    debug!(
+        ctx,
+        "recomputing checksum, old sum: {:x}, new checksum: {:x}", old_checksum, sum
+    );
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
-    use Header::*;
+    use TransportProtocolHeader::*;
 
     let start = ctx.data();
     let end = ctx.data_end();
@@ -114,14 +157,14 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     // Parse the IPv4 header
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    let ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
     let source_addr = u32::from_be(unsafe { (*ipv4hdr).src_addr });
     let dst_addr = u32::from_be(unsafe { (*ipv4hdr).dst_addr });
     let proto = unsafe { (*ipv4hdr).proto };
 
     let (source_port, dst_port, header) = match unsafe { (*ipv4hdr).proto } {
         IpProto::Tcp => {
-            let tcphdr: *const TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let tcphdr: *mut TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
 
             let source_port = u16::from_be(unsafe { (*tcphdr).source });
             let dst_port = u16::from_be(unsafe { (*tcphdr).dest });
@@ -129,7 +172,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             (source_port, dst_port, Tcp(tcphdr))
         }
         IpProto::Udp => {
-            let udphdr: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let udphdr: *mut UdpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
 
             let source_port = u16::from_be(unsafe { (*udphdr).source });
             let dst_port = u16::from_be(unsafe { (*udphdr).dest });
@@ -165,10 +208,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     };
 
     let vip_number = match get_vip_number(vip) {
-        Some(vn) => {
-            info!(&ctx, "found VIP! VIP NUMBER: {}", vn);
-            vn
-        }
+        Some(vn) => vn,
         None => {
             info!(&ctx, "unknown vip");
             return Ok(xdp_action::XDP_PASS);
@@ -185,10 +225,19 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
 
     info!(
         &ctx,
-        "found real server! REAL SERVER: {:i}:{}", dest.addr, dest.port
+        "routing packet VIP: {}, {:i}:{}", vip_number, dest.addr, dest.port
     );
 
-    Ok(xdp_action::XDP_PASS)
+    mangle_packet(&ctx, ipv4hdr, header, dest);
+
+    let new_ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    info!(
+        &ctx,
+        "packet mangled: {:i}",
+        u32::from_be(unsafe { (*new_ipv4hdr).dst_addr })
+    );
+
+    Ok(xdp_action::XDP_TX)
 }
 
 #[panic_handler]
