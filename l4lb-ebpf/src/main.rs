@@ -238,7 +238,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         proto,
     }) {
         Some(vip) => {
-            info!(&ctx, "reverse vip found: {:i}:{}", vip.addr, vip.port);
+            debug!(&ctx, "reverse vip found: {:i}:{}", vip.addr, vip.port);
             // Update the packet to be from the VIP
             mangle_packet(
                 &ctx, ipv4hdr, header, vip.addr, vip.port, dst_addr, dst_port,
