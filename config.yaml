@@ -4,8 +4,8 @@ vips:
     proto: 6 # TCP
     real_servers:
       - addr: 192.168.67.3
-        port: 81
+        port: 80
       - addr: 192.168.67.3
-        port: 82
+        port: 80
       - addr: 192.168.67.3
-        port: 83
+        port: 80

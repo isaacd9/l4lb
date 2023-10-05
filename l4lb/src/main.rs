@@ -15,6 +15,8 @@ use std::fs::File;
 use std::io::Read;
 use tokio::signal;
 
+use crate::config::Vip;
+
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "eth0")]
@@ -48,6 +50,34 @@ fn populate_vip_map(config: &Config, bpf: &mut Bpf) -> Result<(), anyhow::Error>
     Ok(())
 }
 
+fn populate_reverse_vip_map(config: &Config, bpf: &mut Bpf) -> Result<(), anyhow::Error> {
+    use aya::maps::HashMap;
+
+    let mut reverse_vip_map: HashMap<_, RealServer, VipKey> =
+        HashMap::try_from(bpf.map_mut("REVERSE_VIP_INFO").unwrap())?;
+
+    for vip in config.vips.iter() {
+        let vip_key = VipKey {
+            addr: vip.vip.into(),
+            port: vip.port,
+            proto: vip.proto,
+        };
+
+        for real in vip.real_servers.iter() {
+            let real = RealServer {
+                addr: real.addr.into(),
+                port: real.port,
+                proto: vip.proto,
+            };
+            reverse_vip_map.insert(&real, &vip_key, 0)?;
+            // reverse_vip_map.insert(&real, 1, 0)?;
+            debug!("Added reverse VIP {:?} {:?} to map", &real, &vip_key);
+        }
+    }
+
+    Ok(())
+}
+
 struct ConsistentHashPopulator<H: ConsistentHasher> {
     ch_rings: Vec<u32>,
     reals: Vec<RealServer>,
@@ -76,6 +106,7 @@ impl<H: ConsistentHasher> ConsistentHashPopulator<H> {
                 let real_server = RealServer {
                     addr: real.addr.into(),
                     port: real.port,
+                    proto: vip.proto,
                 };
 
                 if self.real_to_index.contains_key(&real) {
@@ -111,9 +142,9 @@ impl<H: ConsistentHasher> ConsistentHashPopulator<H> {
 
         for (i, real) in self.ch_rings.iter().enumerate() {
             ch_rings_map.set(i as u32, real, 0)?;
-
-            debug!("Added ring {} to map", real);
         }
+
+        debug!("Added rings len {} to map", self.ch_rings.len());
 
         Ok(())
     }
@@ -162,6 +193,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     populate_vip_map(&config, &mut bpf)?;
+    populate_reverse_vip_map(&config, &mut bpf)?;
 
     let ch_populator = ConsistentHashPopulator::new(
         &config,

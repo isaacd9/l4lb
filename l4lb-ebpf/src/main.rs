@@ -20,8 +20,13 @@ use network_types::{
 #[map]
 // Map of VIP key to vip number for the VIP consistent hah table
 static VIP_INFO: HashMap<VipKey, u32> = HashMap::with_max_entries(MAX_VIPS, 0);
+// REVERSE_VIP_INFO is a map of RealServer to VipKey. This is used for packets _from_ a real server to a client.
+#[map]
+static REVERSE_VIP_INFO: HashMap<RealServer, VipKey> = HashMap::with_max_entries(MAX_REALS, 0);
+// CH_RINGS is an array of u32s that represent the index of the real server in the REALS array
 #[map]
 static CH_RINGS: Array<u32> = Array::with_max_entries(CH_RINGS_SIZE, 0);
+// REALS is an array of all RealServer structs
 #[map]
 static REALS: Array<RealServer> = Array::with_max_entries(MAX_REALS, 0);
 
@@ -51,6 +56,7 @@ enum TransportProtocolHeader {
     Udp(*mut UdpHdr),
 }
 
+#[inline(always)]
 fn format_flags(hdr: &TransportProtocolHeader) -> &'static str {
     use TransportProtocolHeader::*;
 
@@ -80,7 +86,12 @@ fn get_vip_number(vip: VipKey) -> Option<u32> {
     unsafe { VIP_INFO.get(&vip).copied() }
 }
 
+fn get_reverse_vip(real: RealServer) -> Option<VipKey> {
+    unsafe { REVERSE_VIP_INFO.get(&real).copied() }
+}
+
 // terrible hash function for now
+#[inline(always)]
 fn hash(flow: FiveTuple) -> u32 {
     let mut hash = flow.source_addr;
     hash ^= flow.source_port as u32;
@@ -100,7 +111,7 @@ fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
 }
 
 #[inline(always)]
-fn ipv4_checksum(ctx: &XdpContext, hdr: *const Ipv4Hdr) -> u16 {
+fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     let ptr = hdr as *const u16;
     let length = mem::size_of::<Ipv4Hdr>();
     let mut sum: u32 = 0;
@@ -122,22 +133,41 @@ fn mangle_packet(
     ctx: &XdpContext,
     ipv4hdr: *mut Ipv4Hdr,
     protocol_header: TransportProtocolHeader,
-    real: RealServer,
+    src_addr: u32,
+    src_port: u16,
+    dst_addr: u32,
+    dst_port: u16,
 ) {
-    unsafe { (*ipv4hdr).dst_addr = u32::to_be(real.addr) };
+    unsafe { (*ipv4hdr).src_addr = u32::to_be(src_addr) };
+    unsafe { (*ipv4hdr).dst_addr = u32::to_be(dst_addr) };
+
     // It's possible that we could eliminate this by doing some math on the
     // checksum to avoid recomputing the whole thing. For now tho, just
     // recompute the entire checksum.
     let old_checksum = unsafe { (*ipv4hdr).check };
     // Zero out the checksum before computing it
     unsafe { (*ipv4hdr).check = 0 };
-    let sum = unsafe {
-        (*ipv4hdr).check = ipv4_checksum(ctx, ipv4hdr);
-    };
+    unsafe { (*ipv4hdr).check = ipv4_checksum(ipv4hdr) }
     debug!(
         ctx,
-        "recomputing checksum, old sum: {:x}, new checksum: {:x}", old_checksum, sum
+        "recomputing checksum, old sum: {:x}, new checksum: {:x}",
+        old_checksum,
+        { unsafe { (*ipv4hdr).check } }
     );
+
+    // TODO: update the ports in the transport header
+    /*
+    match protocol_header {
+        TransportProtocolHeader::Tcp(tcphdr) => {
+            unsafe { (*tcphdr).source = u16::to_be(src_port) };
+            unsafe { (*tcphdr).dest = u16::to_be(dst_port) };
+        }
+        TransportProtocolHeader::Udp(udphdr) => {
+            unsafe { (*udphdr).source = u16::to_be(src_port) };
+            unsafe { (*udphdr).dest = u16::to_be(dst_port) };
+        }
+    }
+    */
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
@@ -201,13 +231,31 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         dst_port,
         proto,
     };
-    let vip = VipKey {
+
+    match get_reverse_vip(RealServer {
+        addr: source_addr,
+        port: source_port,
+        proto,
+    }) {
+        Some(vip) => {
+            info!(&ctx, "reverse vip found: {:i}:{}", vip.addr, vip.port);
+            // Update the packet to be from the VIP
+            mangle_packet(
+                &ctx, ipv4hdr, header, vip.addr, vip.port, dst_addr, dst_port,
+            );
+
+            return Ok(xdp_action::XDP_TX);
+        }
+        None => {
+            info!(&ctx, "unknown real server");
+        }
+    };
+
+    let vip_number = match get_vip_number(VipKey {
         addr: dst_addr,
         port: dst_port,
         proto,
-    };
-
-    let vip_number = match get_vip_number(vip) {
+    }) {
         Some(vn) => vn,
         None => {
             info!(&ctx, "unknown vip");
@@ -228,7 +276,15 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         "routing packet VIP: {}, {:i}:{}", vip_number, dest.addr, dest.port
     );
 
-    mangle_packet(&ctx, ipv4hdr, header, dest);
+    mangle_packet(
+        &ctx,
+        ipv4hdr,
+        header,
+        source_addr,
+        source_port,
+        dest.addr,
+        dest.port,
+    );
 
     let new_ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
     info!(

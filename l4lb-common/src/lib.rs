@@ -45,6 +45,7 @@ unsafe impl Pod for VipKey {}
 pub struct RealServer {
     pub addr: u32,
     pub port: u16,
+    pub proto: IpProto,
 }
 
 #[cfg(feature = "user")]
