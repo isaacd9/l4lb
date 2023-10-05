@@ -247,7 +247,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             return Ok(xdp_action::XDP_TX);
         }
         None => {
-            info!(&ctx, "unknown real server");
+            debug!(&ctx, "unknown real server");
         }
     };
 
@@ -258,7 +258,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     }) {
         Some(vn) => vn,
         None => {
-            info!(&ctx, "unknown vip");
+            debug!(&ctx, "unknown vip");
             return Ok(xdp_action::XDP_PASS);
         }
     };
@@ -271,7 +271,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         }
     };
 
-    info!(
+    debug!(
         &ctx,
         "routing packet VIP: {}, {:i}:{}", vip_number, dest.addr, dest.port
     );
@@ -287,7 +287,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     );
 
     let new_ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-    info!(
+    debug!(
         &ctx,
         "packet mangled: {:i}",
         u32::from_be(unsafe { (*new_ipv4hdr).dst_addr })
