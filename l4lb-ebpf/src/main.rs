@@ -113,13 +113,19 @@ fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
 #[inline(always)]
 fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     let ptr = hdr as *const u16;
-    let length = mem::size_of::<Ipv4Hdr>();
+    let length = Ipv4Hdr::LEN;
     let mut sum: u32 = 0;
 
     // Divide the header into 16-bit chunks and sum them. Need to divide by 2
     // because size of is byte-denominated.
     for i in 0..(length / 2) {
         sum += unsafe { *(ptr.add(i)) } as u32;
+    }
+
+    // If the length is odd, we need to add the last byte
+    if length % 2 != 0 {
+        // TODO: fix this
+        // sum += unsafe { (*ptr as *const u8).add(length as usize) } as u32;
     }
 
     while sum >> 16_u32 != 0 {
@@ -129,17 +135,96 @@ fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     !(sum as u16)
 }
 
-fn mangle_packet(
+fn tcp_checksum(
     ctx: &XdpContext,
-    ipv4hdr: *mut Ipv4Hdr,
-    protocol_header: TransportProtocolHeader,
+    ipv4hdr: *const Ipv4Hdr,
+    tcphdr: *const TcpHdr,
+) -> Result<u16, ()> {
+    let mut sum: u32 = 0;
+    // TCP pseudo header
+    sum += unsafe { (*ipv4hdr).src_addr } as u32;
+    sum += unsafe { (*ipv4hdr).dst_addr } as u32;
+    let tot_len = u32::from_be(unsafe { (*ipv4hdr).tot_len } as u32);
+    let ihl = u8::from_be(unsafe { (*ipv4hdr).ihl() }) as u32;
+    let length = tot_len - (ihl * 4);
+    sum += (unsafe { (*ipv4hdr).proto } as u32) << 16_u32 | length;
+
+    /*
+     */
+
+    // sum of header and data
+    let ptr = tcphdr as *const u16;
+    let mut i = 0;
+    // If the length is larger than 16 bits, we can't compute the checksum
+    // let hdr_length = TcpHdr::LEN;
+    // for i in 0..(hdr_length as usize / 2) {
+    // sum += unsafe { *(ptr.add(i as usize)) } as u32;
+    // }
+    while i < (length / 2) {
+        let c = unsafe { ptr.add(i as usize + 1) };
+        if c > 0xffff as *const u16 {
+            break;
+        }
+        sum += unsafe { *(ptr.add(i as usize)) } as u32;
+        i += 1;
+    }
+
+    // TODO: compute the checksum of the data
+    /*
+    info!(
+        ctx,
+        "tcp checksum so far: {:x}. length: {}, hdr length: {}",
+        sum,
+        length,
+        tot_len,
+        ihl * 4,
+        hdr_length,
+        // unsafe { *ptr as u64 },
+        // ctx.data_end() as u64,
+    );
+    */
+
+    // If the length is odd, we need to add the last byte
+    // if length % 2 != 0 {
+    // sum += unsafe { (*ptr as *const u8).add(length as usize) } as u32;
+    // }
+
+    while sum >> 16_u32 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16_u32);
+    }
+
+    Ok(!(sum as u16))
+}
+
+fn incremental_tcp_checksum(old_checksum: u16, old_port: u16, new_port: u16) -> u16 {
+    let mut sum = old_checksum as u32;
+    sum -= old_port as u32;
+    sum += new_port as u32;
+
+    while sum >> 16_u32 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16_u32);
+    }
+
+    !(sum as u16)
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct Mangle {
     src_addr: u32,
     src_port: u16,
     dst_addr: u32,
     dst_port: u16,
+}
+
+fn mangle_packet(
+    ctx: &XdpContext,
+    ipv4hdr: *mut Ipv4Hdr,
+    protocol_header: TransportProtocolHeader,
+    mangle: Mangle,
 ) {
-    unsafe { (*ipv4hdr).src_addr = u32::to_be(src_addr) };
-    unsafe { (*ipv4hdr).dst_addr = u32::to_be(dst_addr) };
+    unsafe { (*ipv4hdr).src_addr = u32::to_be(mangle.src_addr) };
+    unsafe { (*ipv4hdr).dst_addr = u32::to_be(mangle.dst_addr) };
 
     // It's possible that we could eliminate this by doing some math on the
     // checksum to avoid recomputing the whole thing. For now tho, just
@@ -156,18 +241,42 @@ fn mangle_packet(
     );
 
     // TODO: update the ports in the transport header
-    /*
     match protocol_header {
         TransportProtocolHeader::Tcp(tcphdr) => {
-            unsafe { (*tcphdr).source = u16::to_be(src_port) };
-            unsafe { (*tcphdr).dest = u16::to_be(dst_port) };
+            unsafe {
+                (*tcphdr).check = u16::to_be(incremental_tcp_checksum(
+                    u16::from_be((*tcphdr).check),
+                    u16::from_be((*tcphdr).source),
+                    mangle.src_port,
+                ))
+            };
+            unsafe {
+                (*tcphdr).check = u16::to_be(incremental_tcp_checksum(
+                    u16::from_be((*tcphdr).check),
+                    u16::from_be((*tcphdr).dest),
+                    mangle.dst_port,
+                ))
+            };
+            unsafe { (*tcphdr).source = u16::to_be(mangle.src_port) };
+            unsafe { (*tcphdr).dest = u16::to_be(mangle.dst_port) };
+            // unsafe { (*tcphdr).check = 0 };
+            /*
+            let check = match tcp_checksum(ctx, ipv4hdr, tcphdr) {
+                Ok(c) => c,
+                Err(_) => {
+                    info!(ctx, "failed to compute tcp checksum");
+                    return;
+                }
+            };
+
+            unsafe { (*tcphdr).check = check };
+            */
         }
         TransportProtocolHeader::Udp(udphdr) => {
-            unsafe { (*udphdr).source = u16::to_be(src_port) };
-            unsafe { (*udphdr).dest = u16::to_be(dst_port) };
+            unsafe { (*udphdr).source = u16::to_be(mangle.src_port) };
+            unsafe { (*udphdr).dest = u16::to_be(mangle.dst_port) };
         }
     }
-    */
 }
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
@@ -241,7 +350,15 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             debug!(&ctx, "reverse vip found: {:i}:{}", vip.addr, vip.port);
             // Update the packet to be from the VIP
             mangle_packet(
-                &ctx, ipv4hdr, header, vip.addr, vip.port, dst_addr, dst_port,
+                &ctx,
+                ipv4hdr,
+                header,
+                Mangle {
+                    src_addr: vip.addr,
+                    src_port: vip.port,
+                    dst_addr: dst_addr,
+                    dst_port: dst_port,
+                },
             );
 
             return Ok(xdp_action::XDP_TX);
@@ -280,10 +397,12 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         &ctx,
         ipv4hdr,
         header,
-        source_addr,
-        source_port,
-        dest.addr,
-        dest.port,
+        Mangle {
+            src_addr: source_addr,
+            src_port: source_port,
+            dst_addr: dest.addr,
+            dst_port: dest.port,
+        },
     );
 
     let new_ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
