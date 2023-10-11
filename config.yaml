@@ -6,6 +6,6 @@ vips:
       - addr: 192.168.67.3
         port: 81
       - addr: 192.168.67.3
-        port: 81
+        port: 82
       - addr: 192.168.67.3
-        port: 81
+        port: 83
