@@ -3,7 +3,6 @@
 
 use aya_bpf::{
     bindings::xdp_action,
-    helpers::bpf_get_prandom_u32,
     macros::{map, xdp},
     maps::{array::Array, hash_map::HashMap},
     programs::XdpContext,
@@ -13,7 +12,7 @@ use core::mem;
 use l4lb_common::{FiveTuple, RealServer, VipKey, CH_RINGS_SIZE, MAX_REALS, MAX_VIPS, RING_SIZE};
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::{self, IpProto, Ipv4Hdr},
+    ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
     udp::UdpHdr,
 };
@@ -75,6 +74,8 @@ fn format_flags(hdr: &TransportProtocolHeader) -> &'static str {
                 } else {
                     "FIN"
                 }
+            } else if unsafe { (*h).ack() } == 0x1 {
+                "ACK"
             } else {
                 ""
             }
@@ -114,6 +115,7 @@ fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
 #[inline(always)]
 fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     let ptr = hdr as *const u16;
+    // This length is static, and won't support IPv4 headers with options.
     let length = Ipv4Hdr::LEN;
     let mut sum: u32 = 0;
 
@@ -121,12 +123,6 @@ fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     // because size of is byte-denominated.
     for i in 0..(length / 2) {
         sum += unsafe { *(ptr.add(i)) } as u32;
-    }
-
-    // If the length is odd, we need to add the last byte
-    if length % 2 != 0 {
-        // TODO: fix this
-        // sum += unsafe { (*ptr as *const u8).add(length as usize) } as u32;
     }
 
     while sum >> 16_u32 != 0 {
@@ -158,21 +154,15 @@ struct Mangle {
     dst_port: u16,
 }
 
-fn mangle_packet(
-    ctx: &XdpContext,
-    ipv4hdr: *mut Ipv4Hdr,
-    protocol_header: TransportProtocolHeader,
-    mangle: Mangle,
-) {
+fn mangle_packet(ipv4hdr: *mut Ipv4Hdr, protocol_header: TransportProtocolHeader, mangle: Mangle) {
     unsafe { (*ipv4hdr).src_addr = u32::to_be(mangle.src_addr) };
     unsafe { (*ipv4hdr).dst_addr = u32::to_be(mangle.dst_addr) };
 
+    // Zero out the checksum before computing it
+    unsafe { (*ipv4hdr).check = 0 };
     // It's possible that we could eliminate this by doing some math on the
     // checksum to avoid recomputing the whole thing. For now tho, just
     // recompute the entire checksum.
-    let old_checksum = unsafe { (*ipv4hdr).check };
-    // Zero out the checksum before computing it
-    unsafe { (*ipv4hdr).check = 0 };
     unsafe { (*ipv4hdr).check = ipv4_checksum(ipv4hdr) }
 
     // TODO: update the ports in the transport header
@@ -205,13 +195,11 @@ fn mangle_packet(
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     use TransportProtocolHeader::*;
 
-    let mut packet_id = unsafe { bpf_get_prandom_u32() };
-
     let start = ctx.data();
     let end = ctx.data_end();
     let length = (end - start) as i32;
 
-    debug!(&ctx, "[{}] received a packet: len={}", packet_id, length);
+    debug!(&ctx, "received a packet: len={}", length);
 
     let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
     // Only handle IPv4 for now
@@ -246,18 +234,6 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Err(()),
     };
 
-    info!(
-        &ctx,
-        "[{}] SRC IP: {:i}, SRC PORT: {}, DST IP: {:i}, DST PORT: {}, PROTO: {}, FLAGS: [{}]",
-        packet_id,
-        source_addr,
-        source_port,
-        dst_addr,
-        dst_port,
-        proto as u8,
-        format_flags(&header),
-    );
-
     // This is a 5tuple
     let flow = FiveTuple {
         source_addr,
@@ -266,6 +242,20 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         dst_port,
         proto,
     };
+
+    let flow_id = hash(flow);
+
+    info!(
+        &ctx,
+        "[{}] SRC IP: {:i}, SRC PORT: {}, DST IP: {:i}, DST PORT: {}, PROTO: {}, FLAGS: [{}]",
+        flow_id,
+        source_addr,
+        source_port,
+        dst_addr,
+        dst_port,
+        proto as u8,
+        format_flags(&header),
+    );
 
     match get_reverse_vip(RealServer {
         addr: source_addr,
@@ -277,7 +267,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             debug!(
                 &ctx,
                 "[{}] mangling packet from behind VIP: {:i}:{} dest: {:i}:{}",
-                packet_id,
+                flow_id,
                 vip.addr,
                 vip.port,
                 dst_addr,
@@ -285,7 +275,6 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             );
 
             mangle_packet(
-                &ctx,
                 ipv4hdr,
                 header,
                 Mangle {
@@ -327,8 +316,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     debug!(
         &ctx,
         "[{}] mangling packet to VIP {}: src: {:i}:{} dest: {:i}:{}",
+        flow_id,
         vip_number,
-        packet_id,
         source_addr,
         source_port,
         dest.addr,
@@ -336,7 +325,6 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     );
 
     mangle_packet(
-        &ctx,
         ipv4hdr,
         header,
         Mangle {
@@ -346,8 +334,6 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
             dst_port: dest.port,
         },
     );
-
-    let new_ipv4hdr: *mut Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
 
     Ok(xdp_action::XDP_TX)
 }
