@@ -1,6 +1,7 @@
 # l4lb
 
-L4LB is an eBPF layer 4 load balancer written in Rust. L4LB uses
+L4LB is an eBPF layer 4 load balancer written in Rust using the [Aya
+library](https://github.com/aya-rs/aya). L4LB uses
 [XDP](https://docs.cilium.io/en/latest/bpf/) to mangle and route packets
 directly in the kernel, theoretically providing very fast packet processing.
 
