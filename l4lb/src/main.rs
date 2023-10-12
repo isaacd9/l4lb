@@ -121,8 +121,10 @@ impl<H: ConsistentHasher> ConsistentHashPopulator<H> {
 
     fn build_ch_rings(&mut self, config: &Config) {
         // Build consistent hash rings
-        for vip in config.vips.iter() {
-            let ring = self.conistent_hasher.generate_hash_ring(&vip.real_servers);
+        for (vip_no, vip) in config.vips.iter().enumerate() {
+            let ring = self
+                .conistent_hasher
+                .generate_hash_ring(vip_no as u16, &vip.real_servers);
             for real in ring.iter() {
                 let index = self.real_to_index[real];
                 self.ch_rings.push(index as u32);

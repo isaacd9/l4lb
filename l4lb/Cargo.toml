@@ -23,6 +23,8 @@ tokio = { version = "1.25", features = [
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 network-types = "0.0.4"
+mur3 = "0.1"
+
 
 [[bin]]
 name = "l4lb"

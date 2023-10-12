@@ -7,6 +7,7 @@ use aya::Pod;
 // This is the maximum number of VIPs that can be configured
 pub const MAX_VIPS: u32 = 512;
 // This is the maximum number of entries in an individual consistent hash ring
+// This needs to be a prime number for the Maglev algorithm to work
 pub const RING_SIZE: u32 = 65537;
 // This is the maximum number of real IP addresses that can be configured
 pub const MAX_REALS: u32 = 4096;
