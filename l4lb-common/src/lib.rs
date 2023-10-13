@@ -13,6 +13,8 @@ pub const RING_SIZE: u32 = 65537;
 pub const MAX_REALS: u32 = 4096;
 // This is the total size of the consistent hash ring array
 pub const CH_RINGS_SIZE: u32 = RING_SIZE * MAX_VIPS;
+// Default LRU connection table size
+pub const LRU_CONNECTION_TABLE_SIZE: u32 = 1024;
 
 use network_types::ip::IpProto;
 
@@ -29,6 +31,19 @@ pub struct FiveTuple {
 
 #[cfg(feature = "user")]
 unsafe impl Pod for FiveTuple {}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct LRUKey<'a> {
+    pub five_tuple: &'a FiveTuple,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct LRUEntry {
+    pub real_index: u32,
+    pub time: u64,
+}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

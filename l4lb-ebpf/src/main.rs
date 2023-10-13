@@ -4,12 +4,15 @@
 use aya_bpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{array::Array, hash_map::HashMap},
+    maps::{array::Array, hash_map::HashMap, LruPerCpuHashMap},
     programs::XdpContext,
 };
 use aya_log_ebpf::{debug, info};
 use core::mem;
-use l4lb_common::{FiveTuple, RealServer, VipKey, CH_RINGS_SIZE, MAX_REALS, MAX_VIPS, RING_SIZE};
+use l4lb_common::{
+    FiveTuple, LRUEntry, LRUKey, RealServer, VipKey, CH_RINGS_SIZE, LRU_CONNECTION_TABLE_SIZE,
+    MAX_REALS, MAX_VIPS, RING_SIZE,
+};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -29,6 +32,11 @@ static CH_RINGS: Array<u32> = Array::with_max_entries(CH_RINGS_SIZE, 0);
 // REALS is an array of all RealServer structs
 #[map]
 static REALS: Array<RealServer> = Array::with_max_entries(MAX_REALS, 0);
+// LRU_CONNECTION_TABLE is a map of FiveTuple to u32. The u32is the index into
+// the real server array
+#[map]
+static LRU_CONNECTION_TABLE: LruPerCpuHashMap<LRUKey, LRUEntry> =
+    LruPerCpuHashMap::with_max_entries(LRU_CONNECTION_TABLE_SIZE, 0);
 
 #[xdp]
 pub fn l4lb(ctx: XdpContext) -> u32 {
@@ -94,7 +102,7 @@ fn get_reverse_vip(real: RealServer) -> Option<VipKey> {
 
 // terrible hash function for now
 #[inline(always)]
-fn hash(flow: FiveTuple) -> u32 {
+fn hash(flow: &FiveTuple) -> u32 {
     let mut hash = flow.source_addr;
     hash ^= flow.source_port as u32;
     hash ^= flow.dst_addr as u32;
@@ -103,11 +111,29 @@ fn hash(flow: FiveTuple) -> u32 {
     hash
 }
 
-fn get_dest(vip_number: u32, flow: FiveTuple) -> Option<RealServer> {
+// fn get_lru_index(flow: FiveTuple) -> Option<LRUEntry> {
+// unsafe { LRU_CONNECTION_TABLE.get(&flow).copied() }
+// }
+
+fn update_lru_index(flow: &FiveTuple, entry: &LRUEntry) -> Result<(), i64> {
+    unsafe { LRU_CONNECTION_TABLE.insert(&LRUKey { five_tuple: flow }, &entry, 0) }
+}
+
+fn get_dest_and_update_lru(vip_number: u32, flow: &FiveTuple) -> Option<RealServer> {
     let hash = hash(flow);
     let index = hash % RING_SIZE;
 
     let real_index = (vip_number * RING_SIZE) + CH_RINGS.get(index).copied()?;
+
+    update_lru_index(
+        &flow,
+        &LRUEntry {
+            real_index: real_index,
+            // TODO: use bpf_ktime_get_ns to get real time
+            time: 0,
+        },
+    )
+    .ok()?;
 
     REALS.get(real_index).copied()
 }
@@ -243,23 +269,23 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         proto,
     };
 
-    let flow_id = hash(flow);
+    let flow_id = hash(&flow);
 
     info!(
         &ctx,
         "[{}] SRC IP: {:i}, SRC PORT: {}, DST IP: {:i}, DST PORT: {}, PROTO: {}, FLAGS: [{}]",
         flow_id,
-        source_addr,
-        source_port,
-        dst_addr,
-        dst_port,
-        proto as u8,
+        flow.source_addr,
+        flow.source_port,
+        flow.dst_addr,
+        flow.dst_port,
+        flow.proto as u8,
         format_flags(&header),
     );
 
     match get_reverse_vip(RealServer {
-        addr: source_addr,
-        port: source_port,
+        addr: flow.source_addr,
+        port: flow.source_port,
         proto,
     }) {
         Some(vip) => {
@@ -270,8 +296,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
                 flow_id,
                 vip.addr,
                 vip.port,
-                dst_addr,
-                dst_port,
+                flow.dst_addr,
+                flow.dst_port,
             );
 
             mangle_packet(
@@ -280,8 +306,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
                 Mangle {
                     src_addr: vip.addr,
                     src_port: vip.port,
-                    dst_addr: dst_addr,
-                    dst_port: dst_port,
+                    dst_addr: flow.dst_addr,
+                    dst_port: flow.dst_port,
                 },
             );
 
@@ -293,8 +319,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     };
 
     let vip_number = match get_vip_number(VipKey {
-        addr: dst_addr,
-        port: dst_port,
+        addr: flow.dst_addr,
+        port: flow.dst_port,
         proto,
     }) {
         Some(vn) => vn,
@@ -305,7 +331,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         }
     };
 
-    let dest = match get_dest(vip_number, flow) {
+    let dest = match get_dest_and_update_lru(vip_number, &flow) {
         Some(d) => d,
         None => {
             // We don't have a real server for this VIP so drop the packet
@@ -318,8 +344,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         "[{}] mangling packet to VIP {}: src: {:i}:{} dest: {:i}:{}",
         flow_id,
         vip_number,
-        source_addr,
-        source_port,
+        flow.source_addr,
+        flow.source_port,
         dest.addr,
         dest.port,
     );
@@ -328,8 +354,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         ipv4hdr,
         header,
         Mangle {
-            src_addr: source_addr,
-            src_port: source_port,
+            src_addr: flow.source_addr,
+            src_port: flow.source_port,
             dst_addr: dest.addr,
             dst_port: dest.port,
         },
