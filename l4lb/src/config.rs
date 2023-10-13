@@ -21,6 +21,7 @@ pub struct Vip {
 
 #[derive(Debug, PartialEq, Deserialize)]
 pub struct Config {
+    pub consistent_hasher: String,
     pub vips: Vec<Vip>,
 }
 

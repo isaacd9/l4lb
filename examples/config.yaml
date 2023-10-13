@@ -1,3 +1,4 @@
+consistent_hasher: maglev
 vips:
   - vip: 192.168.67.2
     port: 80

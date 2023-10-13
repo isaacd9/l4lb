@@ -78,15 +78,15 @@ fn populate_reverse_vip_map(config: &Config, bpf: &mut Bpf) -> Result<(), anyhow
     Ok(())
 }
 
-struct ConsistentHashPopulator<H: ConsistentHasher> {
+struct ConsistentHashPopulator<H: ConsistentHasher + ?Sized> {
     ch_rings: Vec<u32>,
     reals: Vec<RealServer>,
     real_to_index: HashMap<config::RealServer, usize>,
-    conistent_hasher: H,
+    conistent_hasher: Box<H>,
 }
 
-impl<H: ConsistentHasher> ConsistentHashPopulator<H> {
-    fn new(config: &Config, ch: H) -> Self {
+impl<H: ConsistentHasher + ?Sized> ConsistentHashPopulator<H> {
+    fn new(config: &Config, ch: Box<H>) -> Self {
         let mut populator = ConsistentHashPopulator {
             ch_rings: Vec::new(),
             reals: Vec::new(),
@@ -165,6 +165,14 @@ impl<H: ConsistentHasher> ConsistentHashPopulator<H> {
     }
 }
 
+fn create_consistent_hasher(config: &Config) -> Box<dyn ConsistentHasher> {
+    match config.consistent_hasher.as_str() {
+        "simple" => Box::new(hash::SimpleConsistentHasher::new(l4lb_common::RING_SIZE)),
+        "maglev" => Box::new(hash::MaglevConsistentHasher::new(l4lb_common::RING_SIZE)),
+        _ => panic!("Unknown consistent hasher"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::init();
@@ -197,10 +205,9 @@ async fn main() -> Result<(), anyhow::Error> {
     populate_vip_map(&config, &mut bpf)?;
     populate_reverse_vip_map(&config, &mut bpf)?;
 
-    let ch_populator = ConsistentHashPopulator::new(
-        &config,
-        hash::SimpleConsistentHasher::new(l4lb_common::RING_SIZE),
-    );
+    let hasher = create_consistent_hasher(&config);
+    let ch_populator = ConsistentHashPopulator::new(&config, hasher);
+
     ch_populator.populate(&mut bpf)?;
 
     info!("Waiting for Ctrl-C...");
