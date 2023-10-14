@@ -23,10 +23,13 @@ use network_types::ip::IpProto;
 #[derive(Debug, Copy, Clone)]
 pub struct FiveTuple {
     pub source_addr: u32,
-    pub source_port: u16,
     pub dst_addr: u32,
+    pub source_port: u16,
     pub dst_port: u16,
     pub proto: IpProto,
+    pub pad: u8,
+    pub pad1: u8,
+    pub pad2: u8,
 }
 
 #[cfg(feature = "user")]
@@ -34,14 +37,15 @@ unsafe impl Pod for FiveTuple {}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct LRUKey<'a> {
-    pub five_tuple: &'a FiveTuple,
+pub struct LRUKey {
+    pub five_tuple: FiveTuple,
 }
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct LRUEntry {
     pub real_index: u32,
+    pub flow_id: u32,
     pub time: u64,
 }
 
