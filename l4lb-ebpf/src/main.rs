@@ -4,14 +4,14 @@
 use aya_bpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{array::Array, hash_map::HashMap, LruPerCpuHashMap},
+    maps::{array::Array, hash_map::HashMap, LruHashMap, LruPerCpuHashMap},
     programs::XdpContext,
 };
 use aya_log_ebpf::{debug, info};
 use core::mem;
 use l4lb_common::{
-    FiveTuple, LRUEntry, LRUKey, RealServer, VipKey, CH_RINGS_SIZE, LRU_CONNECTION_TABLE_SIZE,
-    MAX_REALS, MAX_VIPS, RING_SIZE,
+    FiveTuple, LRUEntry, RealServer, VipKey, CH_RINGS_SIZE, LRU_CONNECTION_TABLE_SIZE, MAX_REALS,
+    MAX_VIPS, RING_SIZE,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -34,9 +34,12 @@ static CH_RINGS: Array<u32> = Array::with_max_entries(CH_RINGS_SIZE, 0);
 static REALS: Array<RealServer> = Array::with_max_entries(MAX_REALS, 0);
 // LRU_CONNECTION_TABLE is a map of FiveTuple to u32. The u32is the index into
 // the real server array
+//
+// TODO: use LruPerCpuHashMap instead of LruHashMap. There's some bug where the
+// per cpu map returns an empty but valid pointer in some cases.
 #[map]
-static LRU_CONNECTION_TABLE: LruPerCpuHashMap<FiveTuple, LRUEntry> =
-    LruPerCpuHashMap::with_max_entries(LRU_CONNECTION_TABLE_SIZE, 0);
+static LRU_CONNECTION_TABLE: LruHashMap<FiveTuple, LRUEntry> =
+    LruHashMap::with_max_entries(LRU_CONNECTION_TABLE_SIZE, 0);
 
 #[xdp]
 pub fn l4lb(ctx: XdpContext) -> u32 {
@@ -111,8 +114,8 @@ fn hash(flow: &FiveTuple) -> u32 {
     hash
 }
 
-fn get_lru_index(key: &LRUKey) -> Option<LRUEntry> {
-    unsafe { LRU_CONNECTION_TABLE.get(&key.five_tuple).copied() }
+fn get_lru_index(key: &FiveTuple) -> Option<LRUEntry> {
+    unsafe { LRU_CONNECTION_TABLE.get(&key).copied() }
 }
 
 fn update_lru_index(flow: &FiveTuple, entry: &LRUEntry) -> Result<(), i64> {
@@ -123,24 +126,51 @@ fn get_real(real_index: u32) -> Option<RealServer> {
     unsafe { REALS.get(real_index).copied() }
 }
 
-fn get_dest_and_update_lru(vip_number: u32, flow: &FiveTuple) -> Option<RealServer> {
+fn get_dest_and_update_lru(
+    ctx: &XdpContext,
+    vip_number: u32,
+    flow: &FiveTuple,
+) -> Option<RealServer> {
     let hash = hash(flow);
     let index = hash % RING_SIZE;
 
     let real_index = (vip_number * RING_SIZE) + CH_RINGS.get(index).copied()?;
 
-    update_lru_index(
+    debug!(
+        ctx,
+        "LRU UPDATE: key={:i}:{} -> {:i}:{} ({}) value={{index: {}, flow_id: {}, time: {}}}",
+        flow.source_addr,
+        flow.source_port,
+        flow.dst_addr,
+        flow.dst_port,
+        flow.proto as u8,
+        real_index,
+        hash,
+        0,
+    );
+
+    let real = get_real(real_index)?;
+
+    // If we fail to update the LRU, it's ok to continue. We'll just
+    // need to recompute the hash next time.
+    //
+    // TODO: Figure out if we want to actually return an error
+    _ = update_lru_index(
         &flow,
         &LRUEntry {
-            real_index: real_index,
+            source_addr: flow.source_addr,
+            source_port: flow.source_port,
+            dst_addr: real.addr,
+            dst_port: real.port,
+            proto: real.proto,
             flow_id: hash,
             // TODO: use bpf_ktime_get_ns to get real time
             time: 0,
+            pad: [0; 7],
         },
-    )
-    .ok()?;
+    );
 
-    get_real(real_index)
+    Some(real)
 }
 
 #[inline(always)]
@@ -163,7 +193,7 @@ fn ipv4_checksum(hdr: *const Ipv4Hdr) -> u16 {
     !(sum as u16)
 }
 
-// #[inline(always)]
+#[inline(always)]
 fn incremental_tcp_checksum(old_checksum: u16, old_port: u16, new_port: u16) -> u16 {
     let mut sum = old_checksum as u32;
     sum -= old_port as u32;
@@ -225,40 +255,26 @@ fn mangle_packet(ipv4hdr: *mut Ipv4Hdr, protocol_header: TransportProtocolHeader
 
 fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
     macro_rules! log_mangle {
-        ($flow_id:expr, $flow:expr, $dest:expr) => {
+        ($flow_id:expr, $flow:expr, $mangle:expr) => {
             debug!(
                 &ctx,
-                "[{}] mangling packet to src: {:i}:{} dest: {:i}:{}",
+                "[{}] mangling packet: {:i}:{} dest: {:i}:{}",
                 $flow_id,
-                $flow.source_addr,
-                $flow.source_port,
-                $dest.addr,
-                $dest.port,
+                $mangle.src_addr,
+                $mangle.src_port,
+                $mangle.dst_addr,
+                $mangle.dst_port,
             );
         };
-        ($flow_id:expr, $flow:expr, $dest:expr, $cache_hit:expr) => {
+        ($flow_id:expr, $flow:expr, $mangle:expr, $cache_hit:expr) => {
             debug!(
                 &ctx,
-                "[{}] mangling packet to src: {:i}:{} dest: {:i}:{} [LRU HIT]",
+                "[{}] mangling packet: {:i}:{} dest: {:i}:{} [LRU HIT]",
                 $flow_id,
-                $flow.source_addr,
-                $flow.source_port,
-                $dest.addr,
-                $dest.port,
-            );
-        };
-    }
-
-    macro_rules! log_reverse_mangle {
-        ($flow_id:expr, $vip:expr, $flow:expr) => {
-            debug!(
-                &ctx,
-                "[{}] mangling packet from behind VIP: {:i}:{} dest: {:i}:{}",
-                $flow_id,
-                $vip.addr,
-                $vip.port,
-                $flow.dst_addr,
-                $flow.dst_port,
+                $mangle.src_addr,
+                $mangle.src_port,
+                $mangle.dst_addr,
+                $mangle.dst_port,
             );
         };
     }
@@ -311,17 +327,8 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         dst_addr,
         dst_port,
         proto,
-        pad: 0,
-        pad1: 0,
-        pad2: 0,
+        pad: [0; 3],
     };
-
-    // let lru_entry = get_lru_index(&LRUKey { five_tuple: &flow });
-
-    // let flow_id = match lru_entry {
-    //    Some(le) => le.flow_id,
-    //    None => hash(&flow),
-    // };
 
     let flow_id = hash(&flow);
 
@@ -337,40 +344,48 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         format_flags(&header),
     );
 
-    /*
+    let lru_entry = get_lru_index(&flow);
     if let Some(le) = lru_entry {
-        match get_real(le.real_index) {
-            Some(real) => {
-                // log_mangle!(flow_id, flow, real, true);
-                debug!(
-                    &ctx,
-                    "found real server in LRU cache, real_index: {}. real: {:i}:{}",
-                    le.real_index,
-                    real.addr,
-                    real.port,
-                );
+        debug!(
+            &ctx,
+            "LRU HIT key={:i}:{} -> {:i}:{} ({}) value={{{:i}:{} -> {:i}:{} ({}), flow_id: {}, time: {}}}",
+            flow.source_addr,
+            flow.source_port,
+            flow.dst_addr,
+            flow.dst_port,
+            flow.proto as u8,
 
-                /*
-                mangle_packet(
-                    ipv4hdr,
-                    header,
-                    Mangle {
-                        src_addr: flow.source_addr,
-                        src_port: flow.source_port,
-                        dst_addr: real.addr,
-                        dst_port: real.port,
-                    },
-                );
-                return Ok(xdp_action::XDP_TX);
-                */
-            }
-            None => {
-                // We don't have a real server for this VIP so drop the packet
-                return Ok(xdp_action::XDP_DROP);
-            }
-        }
+            le.source_addr,
+            le.source_port,
+            le.dst_addr,
+            le.dst_port,
+            le.proto as u8,
+
+            le.flow_id,
+            le.time,
+        );
+
+        let mangle = Mangle {
+            src_addr: le.source_addr,
+            src_port: le.source_port,
+            dst_addr: le.dst_addr,
+            dst_port: le.dst_port,
+        };
+        log_mangle!(flow_id, flow, mangle, true);
+        mangle_packet(ipv4hdr, header, mangle);
+
+        return Ok(xdp_action::XDP_TX);
+    } else {
+        debug!(
+            &ctx,
+            "LRU MISS key={:i}:{} -> {:i}:{} ({})",
+            flow.source_addr,
+            flow.source_port,
+            flow.dst_addr,
+            flow.dst_port,
+            flow.proto as u8,
+        );
     }
-    */
 
     match get_reverse_vip(RealServer {
         addr: flow.source_addr,
@@ -380,18 +395,29 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         Some(vip) => {
             // Update the packet to be from the VIP
 
-            log_reverse_mangle!(flow_id, vip, flow);
-
-            mangle_packet(
-                ipv4hdr,
-                header,
-                Mangle {
-                    src_addr: vip.addr,
-                    src_port: vip.port,
+            _ = update_lru_index(
+                &flow,
+                &LRUEntry {
+                    source_addr: vip.addr,
+                    source_port: vip.port,
                     dst_addr: flow.dst_addr,
                     dst_port: flow.dst_port,
+                    proto: vip.proto,
+                    flow_id: flow_id,
+                    // TODO: use bpf_ktime_get_ns to get real time
+                    time: 0,
+                    pad: [0; 7],
                 },
             );
+
+            let mangle = Mangle {
+                src_addr: vip.addr,
+                src_port: vip.port,
+                dst_addr: flow.dst_addr,
+                dst_port: flow.dst_port,
+            };
+            log_mangle!(flow_id, flow, mangle);
+            mangle_packet(ipv4hdr, header, mangle);
 
             return Ok(xdp_action::XDP_TX);
         }
@@ -413,7 +439,7 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         }
     };
 
-    let dest = match get_dest_and_update_lru(vip_number, &flow) {
+    let dest = match get_dest_and_update_lru(&ctx, vip_number, &flow) {
         Some(d) => d,
         None => {
             // We don't have a real server for this VIP so drop the packet
@@ -421,18 +447,14 @@ fn try_l4lb(ctx: XdpContext) -> Result<u32, ()> {
         }
     };
 
-    log_mangle!(flow_id, flow, dest);
-
-    mangle_packet(
-        ipv4hdr,
-        header,
-        Mangle {
-            src_addr: flow.source_addr,
-            src_port: flow.source_port,
-            dst_addr: dest.addr,
-            dst_port: dest.port,
-        },
-    );
+    let mangle = Mangle {
+        src_addr: flow.source_addr,
+        src_port: flow.source_port,
+        dst_addr: dest.addr,
+        dst_port: dest.port,
+    };
+    log_mangle!(flow_id, flow, mangle);
+    mangle_packet(ipv4hdr, header, mangle);
 
     Ok(xdp_action::XDP_TX)
 }
